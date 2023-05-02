@@ -276,9 +276,6 @@ Move the adc\_select\_input() and adc\_read() calls into get\_speed\_cmd(). The 
 This raised the general question of data types on the RPC2040.
 
 
-
-
-
 **Variables**
 
 /[Programming in C/C++](https://raspberry-projects.com/pi/category/programming-in-c) / [Memory](https://raspberry-projects.com/pi/category/programming-in-c/memory) / Variables
@@ -308,6 +305,7 @@ I found this [table](https://raspberry-projects.com/pi/programming-in-c/memory/v
 
 So, unsigned char is 1 byte which is obviously not big enough for the 12-bit adc output. The Zilog code set the speed value to the ADC Data High Byte Register ADCD\_H which the Ziliog datasheet says is the upper eight bits of the 10-bit ADC output, i.e. 0-255. To get the same scale on the Pico the 12-bit value must be shifted right by 4 bits.
 
+
 **PWM**
 
 Now it’s time to bite the bullet and try to get the pulse width modulation working. I started from the sdk pwm\_fade.c example. I copied the pwm setup code into main() at the end of the init calls and the interrupt handler on\_pwm\_wrap() above main(). I added a red led to the diagram on gpio26 and changed the PICO\_DEFAULT\_LED\_PIN constant to PWM\_AL (phase A, High). Amazingly, this worked immediately.
@@ -324,7 +322,122 @@ In pwm\_isr(), replace the alarm\_isr() call by the pwm\_clr\_irq() from main().
 
 This worked, but I noticed that, unfortunately, now the UI was outputting gibberish. After testing on a minimal project with just the sdk test pwm led flashing code and some printf commands, I found that the problem occurred as soon as the gpio pin was defined as 16, which has a slice and channel number of 0. This is the same as the pwm on gpio0, so maybe this was interfering with the uart on pin 0 which handles the terminal? I temporarily changed the led to gpio14, which has slice 7 and channel 0, and everything worked as expected.
 
-To drive a bldc motor, we need three phases each with high and low signals. These need to be driven, commutated in a particular order. This needed to be tested carefully before connecting up to any hardware. The first thing is to add and test the two other phases and the three complementary signals. I thought that red, green and blue sounded good for the three phases and light and dark for the high and low sides. So I choose red for 1H, purple for 1L, dark green for 2H, light green for 2L, dark blue for 3H and light blue for 3L.
+
+**Three Phase PWM**
+
+To drive a bldc motor, we need three phases each with high and low signals. These need to be driven, commutated in a particular order. This needs to be tested carefully before connecting up to any hardware. Add and test the two other phases and the three complementary signals. I thought that red, green and blue sounded good for the three phases and light and dark for the high and low sides. So I choose red for 1H, purple for 1L, dark green for 2H, light green for 2L, dark blue for 3H and light blue for 3L. The mapping to the pins and pwm channels is as follows:
+
+|**LED**|**Phase**|**GPIO**|**PWM**|
+| :- | :- | :- | :- |
+|Red|PWM_1H|10|5A|
+|Magneta|PWM_1L|11|5B|
+|Green|PWM_2H|12|6A|
+|Light Green|PWM_2L|13|6B|
+|Blue|PWM_3H|14|7A|
+|Light Blue|PWM_3L|15|7B|
+
+Define PWM_1H, PWM_1L etc. with the relevant gpio pin number in the constants. Write test_pwm_leds() to initialise and test these leds and call it from main() after the init calls.
+
+Add the init_pwmint() code from the application and call it from the init section of main(). Move the lines setting up the pwm irq from init_pwm() to init_pwmint(). Use the slice associated with gpio PWM_1H as before and test that is still works.
+
+Now it is time to set up these leds as pwm channels. 
+
+The following is the commented out original pwm_int() with notes concerning porting it to the Pico:
+
+- PWMCTL0 = 0x60;			// PWM Off,Output Control On,Center Aligned, ADC Trg Off,Reload off,PWN Disabled
+ PWM off: Places pwm output in off-state. In Pico ??
+
+ Output control: The outputs are selectively disabled according to values in the OUT x bits in the PWMOUT register. This determines which pwm channels are active (only two at a time) according to the commutation sequence in the array com_table[].
+
+ Center aligned: Called phase correct mode in Pico - pwm_set_phase_correct(slice_num, true)
+
+ ADC trg off: In Pico, adc is not triggered by pwm
+
+ Reload off: Do not use values in holding registers at next pwm reload event. In Pico ?
+
+ PWM off: Disable pwm and force output pins to default off-state. On the Pico, the pwm slice is started later by the true value in the pwm_init() call (it can also be started by a call to pwm_set_enabled() or several slices can be started together with a call to pwm_set_mask_enabled()). **When a PWM is disabled, it halts its counter, and the output pins are left high or low depending on exactly when the counter is halted. When re-enabled the PWM resumes immediately from where it left off.** Datasheet explains that if the PWM's output pins need to be low when halted:
+
+ -- The counter compare can be set to zero whilst the PWM is enabled, and then the PWM disabled once both pins are seen to be low
+ -- The GPIO output overrides can be used to force the actual pins low
+ -- The PWM can be run for one cycle (i.e. enabled then immediately disabled) with a TOP of 0, count of 0 and counter compare of 0, to force the pins low when the PWM has already been halted. The same method can be used with a counter compare value of 1 to force a pin high.
+
+- PWMCTL1 = 0x00;			// Reload Every Period, Comp Mode, Polarity Sel, Prescaler
+
+ Reload every period: pwm reload occurs at the end of evary period. Default in Pico?
+
+ Comp mode: pwm operates as 6 independent channels. Default in Pico?
+
+ Polarity sel: Set polarity for each channel.
+
+ Prescaler: Prescaler is divide by 1. In Pico - pwm_config_set_clkdiv(&config, 25.f)
+  
+- PWMDB = Dead_band;		// Deadband 1 clock cycles, 50ns (Write Once)
+
+ Deadband is one clock  cycle. Pico pwm does not have a hardware deadband feature. Implement by offsetting the duty cycles of the complementary channels?
+
+- PWMMPF = 0x01;			// Minimum Pulse Filter
+
+ Minimimum allowed pulse width in pwm cycles. In Pico ?
+
+- PWMOUT = Com_table[Com_step];
+
+ Set the phases of the output according to the communitation step.
+
+- PWMOUT = 0x00;
+
+ This seems to override the prevous line?
+
+- PWMFM = 0x04;			// Enable DBG Fault, Comparator Fault, FAULT0 on
+
+ Faults generated by entering debug mode, comparator (comapres ??) and FAULT0 pin (connected to ??)
+ 
+- PWMFCTL = 0x44;			// DBG and Comparator cause PWM shutdown
+
+ Debug and comparator faults require software controlled recovery - all fault sources deasserted, all fault flags cleared and a pwm reload occurs.
+
+- PWMFSTAT = 0xFF;
+
+ Reset all fault flags
+
+- PWMH = 0x00;			// Timer 1 PWM counter initial
+- PWML = 0x00;			// value
+- PWMRH = 0x00;			// Timer 1 PWM counter reload value
+- PWMRL = Com_mag_max;	// 
+- PWMH0DH = 0x00;			// PWM A duty cycle value
+- PWMH0DL = Com_mag;		// 
+- PWMH1DH = 0x00;			// PWM B duty cycle value
+- PWMH1DL = Com_mag;		// 
+- PWMH2DH = 0x00;			// PWM C duty cycle value
+- PWMH2DL = Com_mag;		// 
+- PWMCTL0 |= 0x83;		// Enable PWM
+- PWMCTL1 |= (0x20 | PWM_prescaler);// Prescaler Setting
+- PWMCTL1 |= Com_pol[Com_step];
+- PWMCTL0 |= 0x03;		//
+
+
+- Set center aligned pwm
+- Set deadband at 1 clock cycle = 50nS
+- Set the minimum pulse filter at 1 pwm cycle
+- Set pwm intial counter value to 0
+- Set pwm reload counter value to COM_MAG_MAX
+- Set the duty cycle of the three phases to com_mag
+- Enable the pwm
+
+
+In the Zilog controller, there is a single counter that is used for all pwm channels. In the Pico each slice has its own timer and two output channels. We will use the timer on slice 1 (associated with e.g. with channel PWM_1H) to drive the interrupt.
+
+
+
+
+static void pwm_config_set_output_polarity(pwm_config *	c, bool	a, bool	b)  // set true to invert A and/or 
+
+**BLDC Commutation**
+
+Application board motor (45ZWN24-30) is specified as: 24V, 2A, 3 phase, N=4 poles, 3200rpm.
+
+
+
+
 
 
 
